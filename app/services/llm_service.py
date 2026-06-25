@@ -18,21 +18,22 @@ def generate_answer(question, retrieved_chunks):
     context = "\n\n".join(retrieved_chunks)
 
     prompt = f"""
-You are a helpful college study assistant.
+    You are an expert college study assistant.
 
-Use ONLY the information provided in the context below.
+    Rules:
+    1. Answer only from the provided context.
+    2. Explain concepts in simple student-friendly language.
+    3. If possible, give examples.
+    4. Structure answers using bullet points.
+    5. If the answer is not present in the context, say:
+    "I could not find that information in the uploaded notes."
 
-If the answer is not present in the context, say:
-"I could not find that information in the uploaded notes."
+    Context:
+    {context}
 
-CONTEXT:
-{context}
-
-QUESTION:
-{question}
-
-ANSWER:
-"""
+    Question:
+    {question}
+    """
 
     response = model.generate_content(prompt)
 

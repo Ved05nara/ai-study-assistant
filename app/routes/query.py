@@ -15,6 +15,12 @@ def stats():
         "total_chunks": collection.count()
     }
 
+@router.get("/health")
+def health():
+    return {
+        "status": "running",
+        "chunks": collection.count()
+    }
 
 class QueryRequest(BaseModel):
     question: str
@@ -53,15 +59,19 @@ async def query_notes(request: QueryRequest):
         request.question,
         retrieved_chunks
     )
-    
-    
+
+    sources = list(
+        set(
+            meta["source"]
+            for meta in metadatas
+        )
+    )
+
+    if answer.strip() == "I could not find that information in the uploaded notes.":
+        sources = ["N/A"]
+  
     return {
         "question": request.question,
         "answer": answer,
-        "sources": list(
-            set(
-                meta["source"]
-                for meta in metadatas
-            )
-        )
+        "sources": sources
     }
