@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback } from "react";
 import { uploadMultipleFiles } from "../services/api";
-
 function formatDate(iso) {
     if (!iso) return "";
     try {
@@ -32,8 +31,8 @@ export default function Sidebar({ documents, onDocumentsChange, onToast }) {
                 if (e.total) setProgress(Math.round((e.loaded / e.total) * 100));
             });
             const data = res.data;
-            const ok = data.results?.length || 0;
-            const errs = data.errors?.length || 0;
+            const ok = data.results?.filter((r) => !r.error).length || 0;
+            const errs = data.results?.filter((r) => r.error).length || 0;
             if (ok > 0) onToast(`${ok} file${ok > 1 ? "s" : ""} uploaded successfully! 🎉`, "success");
             if (errs > 0) onToast(`${errs} file${errs > 1 ? "s" : ""} failed to upload.`, "error");
             onDocumentsChange();
@@ -71,7 +70,7 @@ export default function Sidebar({ documents, onDocumentsChange, onToast }) {
                 {/* Logo */}
                 <div className="sidebar-header">
                     <div className="sidebar-logo">
-                        <div className="sidebar-logo-icon">📚</div>
+                        <div className="sidebar-logo-icon"><img src="campusGPT_Logo2.png" alt="Logo" /></div>
                         <div className="sidebar-logo-text">
                             <h1>CampusGPT</h1>
                             <span>AI-Powered Notes</span>

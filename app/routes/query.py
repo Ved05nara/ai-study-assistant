@@ -6,14 +6,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.services.chroma_service import collection, search_chunks
+from app.services.chroma_service import collection, search_chunks, get_ids_for_filter
 from app.services.embedding_service import model as embed_model
+from app.services.bm25_service import bm25_search
+from app.services.reranker_service import rerank
 from app.services.llm_service import (
-    generate_answer,
-    generate_general_overview,
-    stream_answer,
-    stream_general_overview,
-    compute_confidence,
+    generate_answer, generate_general_overview,
+    stream_answer, stream_general_overview,
 )
 from app.services.memory_service import add_message, clear_history, get_history
 
@@ -21,54 +20,116 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 NO_ANSWER_MSG = "I could not find that information in the uploaded notes."
-RELEVANCE_DISTANCE_THRESHOLD = 0.8
+
+# ── Tuning knobs ───────────────────────────────────────────────────────────────
+VECTOR_FETCH = 10        # how many chunks vector search retrieves
+BM25_FETCH = 10          # how many chunks BM25 retrieves
+RRF_K = 60               # RRF constant (higher = smoother rank fusion)
+RERANK_TOP_K = 5         # candidates sent to cross-encoder, then to LLM
+RELEVANCE_THRESHOLD = 0.0  # cross-encoder scores are unbounded; 0.0 keeps positives
 SEARCH_HISTORY_TURNS = 2
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Reciprocal Rank Fusion ─────────────────────────────────────────────────────
+
+def _rrf_merge(
+    vector_results: tuple[list, list, list],
+    bm25_results: list[dict],
+) -> list[dict]:
+    """
+    Merge vector search and BM25 results using Reciprocal Rank Fusion.
+
+    RRF score = Σ 1 / (k + rank_i)
+
+    Returns a unified list of candidate dicts sorted by RRF score (desc).
+    Each dict has: document, metadata, rrf_score, vector_distance (optional).
+    """
+    v_docs, v_metas, v_dists = vector_results
+
+    scores: dict[str, float] = {}
+    candidates: dict[str, dict] = {}
+
+    # Score vector results
+    for rank, (doc, meta, dist) in enumerate(zip(v_docs, v_metas, v_dists), start=1):
+        uid = meta.get("source", "") + str(meta.get("chunk_index", rank))
+        scores[uid] = scores.get(uid, 0.0) + 1.0 / (RRF_K + rank)
+        candidates[uid] = {
+            "document": doc,
+            "metadata": meta,
+            "vector_distance": dist,
+            "rrf_score": 0.0,
+        }
+
+    # Score BM25 results
+    for result in bm25_results:
+        meta = result["metadata"]
+        uid = meta.get("source", "") + str(meta.get("chunk_index", result["id"]))
+        scores[uid] = scores.get(uid, 0.0) + 1.0 / (RRF_K + result["bm25_rank"])
+        if uid not in candidates:
+            candidates[uid] = {
+                "document": result["document"],
+                "metadata": meta,
+                "vector_distance": None,
+                "rrf_score": 0.0,
+            }
+
+    # Write final RRF scores and sort
+    for uid, score in scores.items():
+        candidates[uid]["rrf_score"] = score
+
+    return sorted(candidates.values(), key=lambda x: x["rrf_score"], reverse=True)
+
+
+# ── Hybrid retrieval pipeline ──────────────────────────────────────────────────
 
 def _build_search_query(question: str, history: list[dict]) -> str:
     recent = [m["content"] for m in history if m["role"] == "user"][-SEARCH_HISTORY_TURNS:]
     return " ".join(recent + [question])
 
 
-def _retrieve(
+def _hybrid_retrieve(
     question: str,
     history: list[dict],
     subject: str | None = None,
     semester: str | None = None,
     department: str | None = None,
     filename: str | None = None,
-) -> tuple[list, list, list]:
-    """Embed question (with history context) and fetch filtered chunks from ChromaDB."""
+) -> list[dict]:
+    """
+    Full hybrid retrieval pipeline:
+      1. Vector search (ChromaDB)
+      2. BM25 keyword search
+      3. RRF merge
+      4. Cross-encoder re-rank → top RERANK_TOP_K
+    """
     search_query = _build_search_query(question, history)
     embedding = embed_model.encode(search_query).tolist()
-    results = search_chunks(
-        embedding,
-        subject=subject,
-        semester=semester,
-        department=department,
-        filename=filename,
+
+    # 1. Vector search
+    v_results = search_chunks(
+        embedding, n_results=VECTOR_FETCH,
+        subject=subject, semester=semester,
+        department=department, filename=filename,
     )
-    docs  = results.get("documents", [[]])[0] if results else []
-    metas = results.get("metadatas", [[]])[0] if results else []
-    dists = results.get("distances", [[]])[0] if results else []
-    return docs, metas, dists
+    v_docs  = v_results.get("documents", [[]])[0] if v_results else []
+    v_metas = v_results.get("metadatas", [[]])[0] if v_results else []
+    v_dists = v_results.get("distances", [[]])[0] if v_results else []
 
+    # 2. BM25 search (respects metadata filters via id allowlist)
+    filter_ids = get_ids_for_filter(subject, semester, department, filename)
+    bm25_results = bm25_search(search_query, n_results=BM25_FETCH, filter_ids=filter_ids)
 
-def _filter_by_relevance(
-    docs: list, metas: list, dists: list
-) -> tuple[list, list, list]:
-    """Drop chunks whose L2 distance exceeds the relevance threshold."""
-    filtered = [
-        (d, m, dist)
-        for d, m, dist in zip(docs, metas, dists)
-        if dist <= RELEVANCE_DISTANCE_THRESHOLD
-    ]
-    if not filtered:
-        return [], [], []
-    docs_f, metas_f, dists_f = zip(*filtered)
-    return list(docs_f), list(metas_f), list(dists_f)
+    # 3. RRF merge
+    merged = _rrf_merge((v_docs, v_metas, v_dists), bm25_results)
+
+    if not merged:
+        return []
+
+    # 4. Cross-encoder re-rank
+    reranked = rerank(question, merged, top_k=RERANK_TOP_K)
+
+    # Filter out chunks with negative cross-encoder scores (clearly irrelevant)
+    return [c for c in reranked if c.get("rerank_score", 0.0) >= RELEVANCE_THRESHOLD]
 
 
 def _sse(payload: dict) -> str:
@@ -84,7 +145,12 @@ def stats():
 
 @router.get("/health")
 def health():
-    return {"status": "running", "chunks": collection.count()}
+    from app.services.bm25_service import is_ready
+    return {
+        "status": "running",
+        "chunks": collection.count(),
+        "bm25_ready": is_ready(),
+    }
 
 
 @router.post("/reset-chat")
@@ -97,31 +163,27 @@ def reset_chat(session_id: str = "default"):
 
 class QueryRequest(BaseModel):
     question: str
-    session_id: str = Field(default="default", description="Session identifier for chat memory")
-
-    # Optional retrieval filters — all are case-insensitive (lowercased at store time)
-    subject: str | None = Field(default=None, description="Filter by subject e.g. 'mathematics'")
-    semester: str | None = Field(default=None, description="Filter by semester e.g. 'sem3'")
-    department: str | None = Field(default=None, description="Filter by department e.g. 'cs'")
-    filename: str | None = Field(default=None, description="Filter by specific document filename")
+    session_id: str = Field(default="default")
+    subject: str | None = Field(default=None)
+    semester: str | None = Field(default=None)
+    department: str | None = Field(default=None)
+    filename: str | None = Field(default=None)
 
 
 # ── Non-streaming /query ───────────────────────────────────────────────────────
 
 @router.post("/query")
 async def query_notes(request: QueryRequest):
-    """Non-streaming fallback. Prefer /query-stream for production."""
     try:
         history = get_history(request.session_id)
-        docs, metas, dists = _retrieve(
+
+        candidates = _hybrid_retrieve(
             request.question, history,
-            subject=request.subject,
-            semester=request.semester,
-            department=request.department,
-            filename=request.filename,
+            subject=request.subject, semester=request.semester,
+            department=request.department, filename=request.filename,
         )
-        docs, metas, dists = _filter_by_relevance(docs, metas, dists)
-        needs_general = not docs
+
+        needs_general = not candidates
 
         if needs_general:
             overview = generate_general_overview(request.question)
@@ -132,14 +194,15 @@ async def query_notes(request: QueryRequest):
             add_message(request.session_id, "user", request.question)
             add_message(request.session_id, "assistant", answer)
             return {
-                "question": request.question,
-                "answer": answer,
-                "sources": [],
-                "chunks_data": [],
-                "confidence_score": 0.0,
-                "answer_source": "general",
+                "question": request.question, "answer": answer,
+                "sources": [], "chunks_data": [],
+                "confidence_score": 0.0, "answer_source": "general",
                 "session_id": request.session_id,
             }
+
+        docs    = [c["document"] for c in candidates]
+        metas   = [c["metadata"] for c in candidates]
+        scores  = [c.get("rerank_score", 0.0) for c in candidates]
 
         start = time.time()
         answer = generate_answer(request.question, docs, history)
@@ -148,27 +211,25 @@ async def query_notes(request: QueryRequest):
         add_message(request.session_id, "user", request.question)
         add_message(request.session_id, "assistant", answer)
 
-        confidence = compute_confidence(dists)
         sources = list({m.get("source", "N/A") for m in metas})
         chunks_data = [
             {
                 "source": m.get("source", "N/A"),
                 "page_number": m.get("page_number", 0),
+                "rerank_score": round(s, 4),
                 "text": d,
             }
-            for d, m in zip(docs, metas)
+            for d, m, s in zip(docs, metas, scores)
         ]
+        confidence = round(max(0.0, min(scores) / 10 + 0.5) * 100, 1) if scores else 0.0
 
         if answer.strip() == NO_ANSWER_MSG:
-            sources, confidence, chunks_data = [], 0.0, []
+            sources, chunks_data, confidence = [], [], 0.0
 
         return {
-            "question": request.question,
-            "answer": answer,
-            "sources": sources,
-            "chunks_data": chunks_data,
-            "confidence_score": confidence,
-            "answer_source": "notes",
+            "question": request.question, "answer": answer,
+            "sources": sources, "chunks_data": chunks_data,
+            "confidence_score": confidence, "answer_source": "notes",
             "session_id": request.session_id,
         }
 
@@ -181,20 +242,17 @@ async def query_notes(request: QueryRequest):
 
 @router.post("/query-stream")
 async def query_notes_stream(request: QueryRequest):
-    """
-    SSE streaming endpoint. Yields tokens as they are generated by Groq.
-    Final event: {"done": true, "confidence_score": X, "sources": [...], ...}
-    """
     history = get_history(request.session_id)
-    docs, metas, dists = _retrieve(
+    candidates = _hybrid_retrieve(
         request.question, history,
-        subject=request.subject,
-        semester=request.semester,
-        department=request.department,
-        filename=request.filename,
+        subject=request.subject, semester=request.semester,
+        department=request.department, filename=request.filename,
     )
-    docs, metas, dists = _filter_by_relevance(docs, metas, dists)
-    needs_general = not docs
+    needs_general = not candidates
+
+    docs   = [c["document"] for c in candidates] if candidates else []
+    metas  = [c["metadata"] for c in candidates] if candidates else []
+    scores = [c.get("rerank_score", 0.0) for c in candidates] if candidates else []
 
     def generate():
         full_answer = ""
@@ -216,16 +274,17 @@ async def query_notes_stream(request: QueryRequest):
                     full_answer += tok
                     yield _sse({"token": tok})
 
-                confidence = compute_confidence(dists)
                 sources = list({m.get("source", "N/A") for m in metas})
                 chunks_data = [
                     {
                         "source": m.get("source", "N/A"),
                         "page_number": m.get("page_number", 0),
+                        "rerank_score": round(s, 4),
                         "text": d,
                     }
-                    for d, m in zip(docs, metas)
+                    for d, m, s in zip(docs, metas, scores)
                 ]
+                confidence = round(max(0.0, min(scores) / 10 + 0.5) * 100, 1) if scores else 0.0
                 answer_source = "notes"
 
                 if full_answer.strip() == NO_ANSWER_MSG:

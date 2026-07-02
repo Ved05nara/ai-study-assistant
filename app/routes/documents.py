@@ -1,6 +1,5 @@
 import logging
 import os
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -15,9 +14,9 @@ UPLOAD_DIR = "uploads"
 
 @router.get("")
 def get_documents(
-    subject: Optional[str] = Query(default=None, description="Filter by subject"),
-    semester: Optional[str] = Query(default=None, description="Filter by semester"),
-    department: Optional[str] = Query(default=None, description="Filter by department"),
+    subject: str | None = Query(default=None, description="Filter by subject"),
+    semester: str | None = Query(default=None, description="Filter by semester"),
+    department: str | None = Query(default=None, description="Filter by department"),
 ):
     """
     Return all indexed documents, with optional filters.

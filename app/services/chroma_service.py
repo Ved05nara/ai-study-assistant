@@ -17,19 +17,13 @@ def store_chunks(
 ) -> None:
     """
     Store text chunks and their embeddings in ChromaDB with rich metadata.
-    Deletes existing chunks for the same filename before inserting,
-    preventing duplicates on re-upload.
-
-    Metadata stored per chunk:
-        source, chunk_index, page_number, upload_time,
-        subject, semester, department
+    Deletes existing chunks for the same filename before inserting.
     """
     existing = collection.get(where={"source": filename})
     if existing and existing["ids"]:
         collection.delete(ids=existing["ids"])
 
     ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
-
     metadatas = [
         {
             "source": filename,
@@ -51,19 +45,29 @@ def store_chunks(
     )
 
 
+def get_all_chunks() -> tuple[list[str], list[str], list[dict]]:
+    """
+    Return all chunks stored in ChromaDB as (documents, ids, metadatas).
+    Used by BM25 to build its index.
+    """
+    try:
+        data = collection.get(include=["documents", "metadatas"])
+        return (
+            data.get("documents") or [],
+            data.get("ids") or [],
+            data.get("metadatas") or [],
+        )
+    except Exception:
+        return [], [], []
+
+
 def _build_where(
     subject: str | None = None,
     semester: str | None = None,
     department: str | None = None,
     filename: str | None = None,
 ) -> dict | None:
-    """
-    Build a ChromaDB `where` filter from optional metadata fields.
-    Combines multiple conditions with $and.
-    Returns None if no filters are active (fetch all).
-    """
     clauses = []
-
     if filename:
         clauses.append({"source": {"$eq": filename}})
     if subject:
@@ -82,18 +86,14 @@ def _build_where(
 
 def search_chunks(
     question_embedding: list[float],
-    n_results: int = 5,
+    n_results: int = 10,
     subject: str | None = None,
     semester: str | None = None,
     department: str | None = None,
     filename: str | None = None,
 ) -> dict:
-    """
-    Query ChromaDB for the most relevant chunks given a question embedding.
-    Optionally filter by subject, semester, department, or filename.
-    """
+    """Vector search with optional metadata filters."""
     where = _build_where(subject, semester, department, filename)
-
     kwargs = dict(
         query_embeddings=[question_embedding],
         n_results=n_results,
@@ -101,8 +101,28 @@ def search_chunks(
     )
     if where:
         kwargs["where"] = where
-
     return collection.query(**kwargs)
+
+
+def get_ids_for_filter(
+    subject: str | None = None,
+    semester: str | None = None,
+    department: str | None = None,
+    filename: str | None = None,
+) -> set[str] | None:
+    """
+    Return the set of chunk IDs that match the given metadata filters.
+    Returns None if no filters are active (meaning: allow all).
+    Used to restrict BM25 results to the same filtered subset as vector search.
+    """
+    where = _build_where(subject, semester, department, filename)
+    if not where:
+        return None
+    try:
+        data = collection.get(where=where, include=[])
+        return set(data.get("ids") or [])
+    except Exception:
+        return None
 
 
 def list_documents(
@@ -110,10 +130,7 @@ def list_documents(
     semester: str | None = None,
     department: str | None = None,
 ) -> list[dict]:
-    """
-    Return all unique documents stored in ChromaDB with their metadata.
-    Optionally filter by subject, semester, or department.
-    """
+    """Return unique documents with metadata, optionally filtered."""
     try:
         where = _build_where(subject=subject, semester=semester, department=department)
         kwargs = {"include": ["metadatas"]}
@@ -142,10 +159,7 @@ def list_documents(
 
 
 def delete_document(filename: str) -> int:
-    """
-    Delete all chunks associated with the given filename from ChromaDB.
-    Returns the number of chunks deleted.
-    """
+    """Delete all chunks for a filename. Returns count deleted."""
     existing = collection.get(where={"source": filename})
     ids = existing.get("ids") or []
     if ids:
